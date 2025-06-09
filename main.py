@@ -18,7 +18,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 # ========== 客户端本地训练函数 ==========
-def local_train(model, train_loader, epochs=1, lr=0.001):
+def local_train(model, train_loader, epochs=1, lr=0.01):
     model = copy.deepcopy(model)
     model.to(device)
     model.train()
