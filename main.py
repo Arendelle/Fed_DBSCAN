@@ -1,37 +1,24 @@
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
+import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import copy
 import random
 from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+
+from Nets import CNNMnist
 
 # ========== CUDA 设置 ==========
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
-# ========== CNN 模型 ==========
-class CNN(nn.Module):
-    def __init__(self):
-        super(CNN, self).__init__()
-        self.conv1 = nn.Conv2d(1, 10, kernel_size=5)
-        self.conv2 = nn.Conv2d(10, 20, kernel_size=5)
-        self.fc1 = nn.Linear(320, 50)
-        self.fc2 = nn.Linear(50, 10)
-
-    def forward(self, x):
-        x = F.relu(F.max_pool2d(self.conv1(x), 2))  # 28x28 → 12x12
-        x = F.relu(F.max_pool2d(self.conv2(x), 2))  # 12x12 → 4x4
-        x = x.view(-1, 320)
-        x = F.relu(self.fc1(x))
-        return self.fc2(x)
-
 # ========== 客户端本地训练函数 ==========
-def local_train(model, train_loader, epochs=1, lr=0.01):
+def local_train(model, train_loader, epochs=1, lr=0.001):
     model = copy.deepcopy(model)
     model.to(device)
     model.train()
@@ -46,8 +33,8 @@ def local_train(model, train_loader, epochs=1, lr=0.01):
             optimizer.step()
     return model.cpu().state_dict()  # 保存为CPU上的权重便于聚合
 
-# ========== 模型聚合函数 ==========
-def average_weights(weights_list):
+# FedAvg聚合函数
+def fed_avg(weights_list):
     avg_weights = copy.deepcopy(weights_list[0])
     for key in avg_weights:
         for i in range(1, len(weights_list)):
@@ -75,91 +62,155 @@ def make_malicious_dataset(dataset, shuffle_labels=True):
         return shuffled_data
     return dataset
 
-# ========== 测试函数 ==========
+# loss和accuracy测试函数
 def test(model, test_loader):
     model.to(device)
     model.eval()
     correct = 0
+    total_loss = 0.0
+    criterion = nn.CrossEntropyLoss()
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
             output = model(data)
-            pred = output.argmax(dim=1)
-            correct += pred.eq(target).sum().item()
-    acc = 100. * correct / len(test_loader.dataset)
-    print(f"Test Accuracy: {acc:.2f}%")
-    return acc
+            loss = criterion(output, target)
+            total_loss += loss.item() * data.size(0)  # 乘以 batch size
+            pred = output.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+    avg_loss = total_loss / len(test_loader.dataset)
+    accuracy = 100. * correct / len(test_loader.dataset)
+    print(f"Test Loss: {avg_loss:.4f}, Accuracy: {accuracy:.2f}%")
+    return avg_loss, accuracy
 
-# ========== 数据准备 ==========
-transform = transforms.Compose([
-    transforms.ToTensor(),
-    transforms.Normalize((0.1307,), (0.3081,))
-])
+# 入口函数
+def main():
+    # ========== 数据准备 ==========
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
 
-train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
-test_dataset  = datasets.MNIST('./data', train=False, transform=transform)
+    train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
+    test_dataset  = datasets.MNIST('./data', train=False, transform=transform)
 
-# 模拟 K 个客户端
-K = 10  # 客户端总数
-client_fraction = 0.5  # 每轮选择 50% 用户参加训练
-num_selected = max(1, int(client_fraction * K))
-client_data_size = len(train_dataset) // K
-client_datasets = [Subset(train_dataset, list(range(i * client_data_size, (i + 1) * client_data_size))) for i in range(K)]
-client_loaders = [DataLoader(ds, batch_size=32, shuffle=True) for ds in client_datasets]
-test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
+    # 客户端模拟
+    K = 50  # 客户端总数
+    client_fraction = 0.3  # 每轮选择参加训练的用户比例
+    num_selected = max(1, int(client_fraction * K))
+    client_data_size = len(train_dataset) // K
+    client_datasets = [Subset(train_dataset, list(range(i * client_data_size, (i + 1) * client_data_size))) for i in range(K)]
+    client_loaders = [DataLoader(ds, batch_size=32, shuffle=True) for ds in client_datasets]
+    test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
 
-# 客户端初始化及恶意注入
-malicious_ratio = 0.2  # 20% 客户端是恶意的
-num_malicious = int(K * malicious_ratio)
-malicious_clients = random.sample(range(K), num_malicious)
-print(f"Malicious clients: {malicious_clients}")
+    # 客户端及恶意客户端初始化
+    malicious_ratio = 0.3  # 恶意客户端占比
+    num_malicious = int(K * malicious_ratio)
+    malicious_clients = random.sample(range(K), num_malicious)
+    # malicious_clients = [1,2,3,4,5]
+    print(f"恶意客户端编号为： {malicious_clients}")
 
-client_datasets = []
-for i in range(K):
-    subset = Subset(train_dataset, list(range(i * client_data_size, (i + 1) * client_data_size)))
-    if i in malicious_clients:
-        # 使用打乱标签的数据（转换为list，打乱）
-        subset = make_malicious_dataset(subset)
-    client_datasets.append(subset)
+    client_datasets = []
+    for i in range(K):
+        subset = Subset(train_dataset, list(range(i * client_data_size, (i + 1) * client_data_size)))
+        if i in malicious_clients:
+            # 使用打乱标签的数据（转换为list，打乱）
+            subset = make_malicious_dataset(subset)
+        client_datasets.append(subset)
 
-client_loaders = [DataLoader(ds, batch_size=32, shuffle=True) for ds in client_datasets]
+    client_loaders = [DataLoader(ds, batch_size=32, shuffle=True) for ds in client_datasets]
 
-# 联邦学习循环 + DBSCAN 检测
-global_model = CNN().to(device)
-rounds = 10
+    # 输出训练配置
+    print(f"客户端总数： {K}")
+    print(f"恶意客户端占比： {malicious_ratio}")
+    print(f"每轮参与的客户端数量： {num_selected}")
+    # 带恶意客户端检测的训练
+    print("开始带恶意客户端检测的训练")
+    loss_history_w_detection, acc_history_w_detection = fed_loop(K, num_selected, client_loaders, test_loader, True)
+    # 不带恶意客户端检测的训练
+    print("开始不含恶意客户端检测的训练")
+    loss_history_wo_detection, acc_history_wo_detection = fed_loop(K, num_selected, client_loaders, test_loader, False)
+    # 绘制损失曲线
+    plt.figure(figsize=(10, 5))
+    plt.plot(loss_history_w_detection, label="Loss with Detection")
+    plt.plot(loss_history_wo_detection, label="Loss without Detection")
+    plt.title("Loss w/wo Detection")
+    plt.xlabel("Round")
+    plt.ylabel("Loss")
+    plt.legend()
+    plt.grid()
+    plt.show()
+    # 绘制准确度曲线
+    plt.figure(figsize=(10, 5))
+    plt.plot(acc_history_w_detection, label="Accuracy with Detection")
+    plt.plot(acc_history_wo_detection, label="Accuracy without Detection")
+    plt.title("Accuracy w/wo Detection")
+    plt.xlabel("Round")
+    plt.ylabel("Accuracy (%)")
+    plt.legend()
+    plt.grid()
+    plt.show()
 
-for r in range(rounds):
-    print(f"\n--- Round {r+1} ---")
-    local_weights = []
-    diff_vectors = []
+# 联邦学习主循环
+def fed_loop(K, num_selected, client_loaders, test_loader, detection: bool):
+    # 联邦学习主循环
+    global_model = CNNMnist().to(device)
+    rounds = 15
+    test_loss_history = []
+    test_acc_history = []
 
-    base_weights = copy.deepcopy(global_model.cpu().state_dict())
+    for r in range(rounds):
+        print(f"\n--- Round {r+1} / {rounds} ---")
+        local_weights = []
+        diff_vectors = []
 
-    selected_clients = random.sample(range(K), num_selected)
-    print("Selected clients:", selected_clients)
+        base_weights = copy.deepcopy(global_model.cpu().state_dict())
 
-    for client_idx in selected_clients:
-        local_model_weights = local_train(global_model, client_loaders[client_idx], epochs=1)
-        local_weights.append(local_model_weights)
+        selected_clients = random.sample(range(K), num_selected)
+        print("Selected clients:", selected_clients)
 
-        vec = model_diff_vector(base_weights, local_model_weights)
-        diff_vectors.append(vec)
+        for client_idx in selected_clients:
+            local_model_weights = local_train(global_model, client_loaders[client_idx], epochs=2)
+            local_weights.append(local_model_weights)
 
-    # 特征标准化 + DBSCAN
-    X = StandardScaler().fit_transform(diff_vectors)
-    clustering = DBSCAN(eps=240.0, min_samples=2).fit(X)
+            vec = model_diff_vector(base_weights, local_model_weights)
+            diff_vectors.append(vec)
 
-    # 聚类标签仅对应选中客户端
-    selected_indices = [i for i, label in enumerate(clustering.labels_) if label != -1]
-    print("DBSCAN labels:", clustering.labels_)
-    print("Selected (benign) clients:", [selected_clients[i] for i in selected_indices])
+        if detection:   # 运行DBSCAN聚类检测
+            # 特征标准化
+            X = StandardScaler().fit_transform(diff_vectors)
+            # DBSCAN聚类
+            clustering = DBSCAN(eps=220.0, min_samples=3).fit(X)
 
-    if not selected_indices:
-        print("⚠️ 全部参与客户端被标记为异常，使用全部参与者")
-        selected_indices = list(range(len(selected_clients)))
+            # 筛选出最多客户端的簇
+            # selected_indices = [i for i, label in enumerate(clustering.labels_) if label != -1]
+            dbscan_labels = clustering.labels_
+            unique, counts = np.unique(dbscan_labels[dbscan_labels != -1], return_counts=True)
+            largest_cluster = 0
+            if len(unique) > 0:
+                max_count_idx = np.argmax(counts)
+                largest_cluster = unique[max_count_idx]
+                # print("样本最多的簇为:", largest_cluster)
 
-    benign_weights = [local_weights[i] for i in selected_indices]
-    averaged_weights = average_weights(benign_weights)
-    global_model.load_state_dict(averaged_weights)
+            selected_indices = [i for i, label in enumerate(dbscan_labels) if label == largest_cluster]
+            print("DBSCAN labels:", dbscan_labels)
+            print("Selected (benign) clients:", [selected_clients[i] for i in selected_indices])
 
-    test(global_model, test_loader)
+            if not selected_indices:
+                print("警告：全部参与客户端被标记为异常，使用全部参与者")
+                selected_indices = list(range(len(selected_clients)))
+        else:   # 不运行DBSCAN聚类检测
+            print("接受恶意客户端参与训练")
+            selected_indices = np.arange(len(selected_clients))
+
+        benign_weights = [local_weights[i] for i in selected_indices]
+        averaged_weights = fed_avg(benign_weights)
+        global_model.load_state_dict(averaged_weights)
+
+        loss, acc = test(global_model, test_loader)
+        test_loss_history.append(loss)
+        test_acc_history.append(acc)
+
+    return test_loss_history, test_acc_history
+
+if __name__ == "__main__":
+    main()
