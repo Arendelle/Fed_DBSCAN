@@ -11,6 +11,8 @@ from sklearn.cluster import DBSCAN
 from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 
+import csv
+
 from Nets import CNNMnist
 
 # ========== CUDA 设置 ==========
@@ -18,7 +20,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
 
 # ========== 客户端本地训练函数 ==========
-def local_train(model, train_loader, epochs=1, lr=0.01):
+def local_train(model, train_loader, epochs=1, lr=0.005):
     model = copy.deepcopy(model)
     model.to(device)
     model.train()
@@ -53,7 +55,7 @@ def model_diff_vector(base_state, updated_state):
         diff.append(diff_tensor.view(-1))
     return torch.cat(diff).numpy()
 
-# 构造恶意客户端
+# 构造恶意客户端数据集
 def make_malicious_dataset(dataset, shuffle_labels=True):
     if shuffle_labels:
         labels = [label for _, label in dataset]
@@ -61,6 +63,26 @@ def make_malicious_dataset(dataset, shuffle_labels=True):
         shuffled_data = [(img, labels[i]) for i, (img, _) in enumerate(dataset)]
         return shuffled_data
     return dataset
+# 构造恶意客户端数据集 - 有目标攻击
+def targeted_malicious_dataset(dataset, source_label=None, target_label=None):
+    # 如果未指定攻击标签，则随机选择一个 source → target 映射
+    if source_label is None or target_label is None:
+        source_label, target_label = random.sample(range(10), 2)
+    print(f"Malicious attack: {source_label} → {target_label}")
+
+    # 将数据转换为 list，便于处理
+    data_list = list(dataset)
+
+    # 有目标攻击：将 source_label 的样本标签篡改为 target_label
+    poisoned_data = []
+    for img, label in data_list:
+        if label == source_label:
+            poisoned_data.append((img, target_label))
+        else:
+            poisoned_data.append((img, label))
+
+    return poisoned_data
+
 
 # loss和accuracy测试函数
 def test(model, test_loader):
@@ -95,7 +117,7 @@ def main():
 
     # 客户端模拟
     K = 50  # 客户端总数
-    client_fraction = 0.3  # 每轮选择参加训练的用户比例
+    client_fraction = 0.7  # 每轮选择参加训练的用户比例
     num_selected = max(1, int(client_fraction * K))
     client_data_size = len(train_dataset) // K
     client_datasets = [Subset(train_dataset, list(range(i * client_data_size, (i + 1) * client_data_size))) for i in range(K)]
@@ -103,10 +125,10 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
 
     # 客户端及恶意客户端初始化
-    malicious_ratio = 0.3  # 恶意客户端占比
+    malicious_ratio = 0.4  # 恶意客户端占比
     num_malicious = int(K * malicious_ratio)
     malicious_clients = random.sample(range(K), num_malicious)
-    # malicious_clients = [1,2,3,4,5]
+    # malicious_clients = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
     print(f"恶意客户端编号为： {malicious_clients}")
 
     client_datasets = []
@@ -114,7 +136,9 @@ def main():
         subset = Subset(train_dataset, list(range(i * client_data_size, (i + 1) * client_data_size)))
         if i in malicious_clients:
             # 使用打乱标签的数据（转换为list，打乱）
-            subset = make_malicious_dataset(subset)
+            # subset = make_malicious_dataset(subset)
+            # 有目标攻击
+            subset = targeted_malicious_dataset(subset, 1, 8)
         client_datasets.append(subset)
 
     client_loaders = [DataLoader(ds, batch_size=32, shuffle=True) for ds in client_datasets]
@@ -139,6 +163,7 @@ def main():
     plt.legend()
     plt.grid()
     plt.show()
+    # plt.savefig("./out/loss_curve_mal_{}.png".format(malicious_ratio))
     # 绘制准确度曲线
     plt.figure(figsize=(10, 5))
     plt.plot(acc_history_w_detection, label="Accuracy with Detection")
@@ -149,12 +174,23 @@ def main():
     plt.legend()
     plt.grid()
     plt.show()
+    # plt.savefig("./out/acc_curve_mal_{}.png".format(malicious_ratio))
+    # 存储统计数据
+    filename = "./out/output_acc_wo_detection_mal_" + str(malicious_ratio) + ".csv"
+    with open(filename, 'w', encoding='utf-8', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(acc_history_wo_detection)
+
+    filename = "./out/output_acc_w_detection_mal_" + str(malicious_ratio) + ".csv"
+    with open(filename, 'w', encoding='utf-8', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(acc_history_w_detection)
 
 # 联邦学习主循环
 def fed_loop(K, num_selected, client_loaders, test_loader, detection: bool):
     # 联邦学习主循环
     global_model = CNNMnist().to(device)
-    rounds = 15
+    rounds = 50
     test_loss_history = []
     test_acc_history = []
 
@@ -166,10 +202,10 @@ def fed_loop(K, num_selected, client_loaders, test_loader, detection: bool):
         base_weights = copy.deepcopy(global_model.cpu().state_dict())
 
         selected_clients = random.sample(range(K), num_selected)
-        print("Selected clients:", selected_clients)
+        print("Selected candidate clients:", selected_clients)
 
         for client_idx in selected_clients:
-            local_model_weights = local_train(global_model, client_loaders[client_idx], epochs=2)
+            local_model_weights = local_train(global_model, client_loaders[client_idx], epochs=1)
             local_weights.append(local_model_weights)
 
             vec = model_diff_vector(base_weights, local_model_weights)
@@ -179,7 +215,7 @@ def fed_loop(K, num_selected, client_loaders, test_loader, detection: bool):
             # 特征标准化
             X = StandardScaler().fit_transform(diff_vectors)
             # DBSCAN聚类
-            clustering = DBSCAN(eps=220.0, min_samples=3).fit(X)
+            clustering = DBSCAN(eps=190.0, min_samples=2).fit(X)
 
             # 筛选出最多客户端的簇
             # selected_indices = [i for i, label in enumerate(clustering.labels_) if label != -1]
@@ -192,7 +228,7 @@ def fed_loop(K, num_selected, client_loaders, test_loader, detection: bool):
                 # print("样本最多的簇为:", largest_cluster)
 
             selected_indices = [i for i, label in enumerate(dbscan_labels) if label == largest_cluster]
-            print("DBSCAN labels:", dbscan_labels)
+            print("DBSCAN labels:             ", dbscan_labels)
             print("Selected (benign) clients:", [selected_clients[i] for i in selected_indices])
 
             if not selected_indices:
