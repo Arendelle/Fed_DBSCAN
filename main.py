@@ -117,7 +117,7 @@ def main():
 
     # 客户端模拟
     K = 50  # 客户端总数
-    client_fraction = 0.7  # 每轮选择参加训练的用户比例
+    client_fraction = 0.5  # 每轮选择参加训练的用户比例
     num_selected = max(1, int(client_fraction * K))
     client_data_size = len(train_dataset) // K
     client_datasets = [Subset(train_dataset, list(range(i * client_data_size, (i + 1) * client_data_size))) for i in range(K)]
@@ -125,7 +125,7 @@ def main():
     test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
 
     # 客户端及恶意客户端初始化
-    malicious_ratio = 0.4  # 恶意客户端占比
+    malicious_ratio = 0.0  # 恶意客户端占比
     num_malicious = int(K * malicious_ratio)
     malicious_clients = random.sample(range(K), num_malicious)
     # malicious_clients = [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19]
